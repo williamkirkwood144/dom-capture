@@ -8,6 +8,8 @@
     "test": "node test/run.mjs && node test/e2e.mjs",
     "test:capture": "node test/run.mjs",
     "test:e2e": "node test/e2e.mjs",
+    "test:evidence": "node test/evidence-runner.test.mjs",
+    "evidence": "node tools/evidence-runner.mjs",
     "test:sites": "node test/real-sites.mjs",
     "icons": "for s in 16 32 48 128; do rsvg-convert -w $s -h $s scripts/icon.svg -o extension/icons/icon$s.png; done",
     "zip": "cd extension && zip -r ../dom-capture.zip . -x '*.DS_Store'"

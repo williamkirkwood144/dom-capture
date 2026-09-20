@@ -132,6 +132,7 @@ The log is plain text: extension version, page URL, browser, options, the picked
 - Sizing of `::before` / `::after` comes from `getComputedStyle` (pixels) unless a readable stylesheet shows it was `auto` or a percentage.
 - Behind a **modal** `<dialog>` the browser makes everything else inert, the overlay included: picking still works, but the dialog's content does see your `:hover` while you pick.
 - `<iframe>` content is not entered (the iframe is kept with an absolute `src`); `<video>` and `blob:` media keep their URLs.
+- A locator screenshot is not a safe crop for a tall section when a fixed or sticky sibling (for example, a site header) can overlap it during Playwright scrolling. For pixel comparison in that case, capture the full source page and crop it from the recorded target geometry; inspect the crop for overlap rather than treating the locator image as isolated section pixels.
 - Quirks-mode pages (no doctype) can differ by a few pixels once pasted into a standards-mode file.
 - Privileged pages (`chrome://`, the extension gallery, the PDF viewer) can't be scripted at all — the icon shows a red `!` there.
 
@@ -159,6 +160,18 @@ npm test
 **`test/e2e.mjs`** loads the real extension, drives the picker with mouse and keyboard, and reads the result from the clipboard — this is what proves closed shadow roots work through `chrome.dom`. `test/fixtures/dropdowns.html` covers picking inside an open popover, a click-outside dropdown in a closed shadow root, and a modal dialog.
 
 **`test/real-sites.mjs`** is a manual, network-dependent smoke test. Its targets aren't checked in: copy `test/real-sites.example.json` to `test/real-sites.json` and list your own pages as `["name", "url", "css selector"]`. Screenshots land in `test/output/real/`.
+
+### Evidence bundles (no extension installation)
+
+For a repeatable source-to-template evidence bundle, copy `evidence.config.example.json` and populate it only with origins you are authorized to inspect. The runner uses Playwright directly; it never loads the browser extension or sends data anywhere.
+
+```sh
+npm run evidence -- evidence.config.json evidence-output
+```
+
+Each capture emits a sanitized DOM Capture page (`.snapshot.html`), a redacted source screenshot (`.source.png`), and a `.json` record. The versioned `manifest.json` indexes the run. Records include requested/final safe URL and path, title, configured state, effective viewport/client width/DPR/font readiness, scroll/document height, root box, timing, warnings, local artifact paths and SHA-256s, and an asset URL inventory. Output is gitignored: snapshots and screenshots remain local evidence and are never added to this repository or uploaded anywhere. URLs must match an exact allowlisted origin, use credential-free HTTP(S), and may not redirect; blank titles, incomplete/failed fonts, and target `<img>` elements that fail or do not decode before capture are rejected. The receipt records image-ready totals plus sanitized failed/timed-out image URLs; it explicitly marks CSS background images as `not-verified`, because browser CSS backgrounds have no equivalent per-image decode signal. The gate waits up to 10 seconds by default; set a global or per-capture `imageReadyTimeoutMs` (1–30000) when a different bounded wait is appropriate. Selectors are captured at configured viewports, and optional bounds fail the record when the target is absent, invisible, or outside its allowed size. State is restricted to declared click, hover, and focus selector actions—configs cannot execute arbitrary page JavaScript.
+
+Form fields identified as passwords or by common sensitive names (token, card, email, phone, and similar) are redacted from emitted HTML and masked in screenshots. Query-string values are redacted in all emitted output. This is deliberately a best-effort safeguard: do not target pages containing secrets in ordinary visible text, images, canvas, or remote assets; inspect bundles before sharing them.
 
 ## Licence
 

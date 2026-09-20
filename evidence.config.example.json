@@ -1,0 +1,13 @@
+{
+  "allowlist": ["https://example.com"],
+  "viewport": { "width": 1280, "height": 900 },
+  "captures": [
+    {
+      "name": "example-main",
+      "url": "https://example.com/",
+      "selector": "main",
+      "bounds": { "maxWidth": 1400, "maxHeight": 1800 },
+      "state": { "actions": [{ "action": "hover", "selector": "a" }], "waitMs": 200 }
+    }
+  ]
+}
