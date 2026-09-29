@@ -39,6 +39,10 @@ export function validateConfig(config) {
     if (!Number.isInteger(vp.width) || !Number.isInteger(vp.height) || vp.width < 1 || vp.height < 1 || vp.width > 5000 || vp.height > 5000) throw new Error(`captures[${index}] has an invalid viewport`);
     const imageReadyTimeoutMs = capture.imageReadyTimeoutMs ?? config.imageReadyTimeoutMs ?? 10000;
     if (!Number.isInteger(imageReadyTimeoutMs) || imageReadyTimeoutMs < 1 || imageReadyTimeoutMs > 30000) throw new Error(`captures[${index}] has an invalid imageReadyTimeoutMs`);
+    const scrollSweep = capture.scrollSweep ?? config.scrollSweep;
+    if (scrollSweep !== undefined && typeof scrollSweep !== 'boolean') throw new Error(`captures[${index}] has an invalid scrollSweep`);
+    const captureViewport = capture.captureViewport ?? config.captureViewport;
+    if (captureViewport !== undefined && typeof captureViewport !== 'boolean') throw new Error(`captures[${index}] has an invalid captureViewport`);
     for (const action of capture.state?.actions || []) {
       if (!['click', 'hover', 'focus'].includes(action.action) || typeof action.selector !== 'string') throw new Error(`captures[${index}] has an invalid state action`);
     }
@@ -125,10 +129,16 @@ export function safeEvidenceAssetUrl(value) {
 export function summarizeImageReadiness(images) {
   const failed = images.filter((image) => image.status === 'failed');
   const timedOut = images.filter((image) => image.status === 'timed-out');
+  const notRequested = images.filter((image) => image.status === 'not-requested');
   return {
     total: images.length,
     loaded: images.filter((image) => image.status === 'loaded').length,
-    notRequested: images.filter((image) => image.status === 'not-requested').length,
+    notRequested: notRequested.length,
+    // Listed (not just counted) so a not-rendered site-owned image is
+    // traceable in the record rather than silently dropped into a number —
+    // most not-requested images are simply <img> tags with no src, which
+    // carry no reason.
+    notRequestedDetail: notRequested.filter((image) => image.url).map((image) => ({ url: safeEvidenceAssetUrl(image.url), reason: image.reason })),
     failed: failed.map((image) => ({ url: safeEvidenceAssetUrl(image.url), reason: image.reason })),
     timedOut: timedOut.map((image) => ({ url: safeEvidenceAssetUrl(image.url) })),
     // CSS backgrounds can be painted by the target, but are not HTMLImageElements
@@ -141,6 +151,20 @@ export function summarizeImageReadiness(images) {
 export async function imageDecodeStatus(img, timeoutMs) {
   const url = img.currentSrc || img.src || '';
   if (!url) return { url, status: 'not-requested' };
+  // getClientRects() is empty exactly when the element or an ancestor is
+  // display:none — unlike offsetParent, it isn't also thrown off by
+  // position:fixed, and unlike a zero-size boundingClientRect it doesn't
+  // false-positive on visibility:hidden/opacity:0 (which still paint an
+  // area and so can legitimately decode). A page-builder duplicate marked
+  // hidden at every breakpoint (e.g. Elementor's elementor-hidden-* classes
+  // stacked to cover desktop/laptop/tablet/mobile all at once) never gets a
+  // box, so native `loading="lazy"` never sees it near any viewport and
+  // never fetches it — confirmed by probing goodhandsplumbing.com.au's own
+  // markup. Waiting on it is unwinnable, and the browser never asked for it
+  // either, so it is a not-requested, not a failure of the site's imagery.
+  if (img.getClientRects().length === 0) {
+    return { url, status: 'not-requested', reason: 'not rendered (display:none in its ancestry at this viewport)' };
+  }
   // A completed resource with no intrinsic width is conclusively broken. Avoid
   // relying on decode() for this case, as browser behavior varies after errors.
   if (img.complete && img.naturalWidth === 0) {
@@ -176,6 +200,50 @@ async function applyState(page, state = {}) {
   if (state.waitMs) await page.waitForTimeout(Math.min(Math.max(state.waitMs, 0), 10000));
 }
 
+// The capture viewport is capped (see validateConfig) well below the height of
+// many real pages, so a `loading="lazy"` image below that fold never enters
+// the layout viewport on its own. Two separate things gate on proximity to
+// the *current* scroll position, not just having been scrolled past once:
+// the fetch (gated by the standard lazy-loading distance threshold) and,
+// separately, the actual decode/raster (Chromium defers it for off-screen
+// lazy images even after the bytes have arrived — confirmed by probing: an
+// image can already show a nonzero naturalWidth from a header-only partial
+// read while `decode()` never settles until the image is genuinely near the
+// viewport). So it is not enough to scroll past a position and move on —
+// each stop must explicitly decode() the images that just became reachable
+// while still parked there, because a completed decode does stick after
+// scrolling away again (also confirmed by probing). Scrolling back to the
+// top at the end restores the position a fresh load would show, without
+// undoing that work.
+async function scrollThroughPage(page, { stepDelayMs = 300, decodeTimeoutMs = 4000 } = {}) {
+  await page.evaluate(async ({ delay, decodeTimeoutMs }) => {
+    const decodeSettledImages = async () => {
+      const imgs = [...document.querySelectorAll('img')];
+      await Promise.all(imgs.map((img) => Promise.race([
+        Promise.resolve().then(() => img.decode()).catch(() => {}),
+        new Promise((resolve) => setTimeout(resolve, decodeTimeoutMs)),
+      ])));
+    };
+    const step = () => Math.max(window.innerHeight || 800, 1);
+    let y = 0;
+    let previousHeight = -1;
+    // Bounded by document height, which can grow as lazy sections mount; a
+    // generous iteration cap keeps this from looping forever on a page that
+    // never stabilizes.
+    for (let i = 0; i < 200; i += 1) {
+      const scrollHeight = document.documentElement.scrollHeight;
+      if (y >= scrollHeight && scrollHeight === previousHeight) break;
+      previousHeight = scrollHeight;
+      window.scrollTo(0, y);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      await decodeSettledImages();
+      y += step();
+    }
+    window.scrollTo(0, 0);
+    await new Promise((resolve) => setTimeout(resolve, delay));
+  }, { delay: stepDelayMs, decodeTimeoutMs });
+}
+
 async function main() {
   const [configFile, outputArg] = process.argv.slice(2);
   if (!configFile) throw new Error('Usage: npm run evidence -- evidence.config.json [output-dir]');
@@ -197,6 +265,8 @@ async function main() {
         const began = performance.now();
         await page.goto(item.url, { waitUntil: 'load', timeout: item.timeoutMs || 30000 });
         await applyState(page, item.state);
+        const scrollSweep = item.scrollSweep ?? config.scrollSweep ?? false;
+        if (scrollSweep) await scrollThroughPage(page);
         record.source.finalUrl = validateFinalUrl(page.url(), allowlist, item.url);
         const target = page.locator(item.selector).first();
         await target.scrollIntoViewIfNeeded();
@@ -222,6 +292,9 @@ async function main() {
         const result = await target.evaluate(async (el) => window.__domCapture.capture(el, { id: 'dce' }));
         record.timing.captureMs = Math.round(performance.now() - began - record.timing.beforeCaptureMs);
         record.warnings = result.warnings || [];
+        for (const image of record.imageReadiness.notRequestedDetail) {
+          record.warnings.push(`image readiness: not-requested, ${image.reason} — ${image.url}`);
+        }
         const snapshot = await page.evaluate(redactInPage, result.page);
         const snapshotPath = `${item.name}.snapshot.html`;
         await writeFile(path.join(output, snapshotPath), snapshot);
@@ -229,7 +302,20 @@ async function main() {
         record.assets = assetInventory(snapshot);
         await maskLiveSensitiveControls(page);
         const screenshotPath = `${item.name}.source.png`;
-        const screenshot = await target.screenshot({ animations: 'disabled' });
+        // An element screenshot is clipped to the TARGET's own layout box, not
+        // its visual paint bounds. A state action that opens an absolutely
+        // positioned overlay (a mobile nav panel, a popover) grows what's
+        // painted without growing the trigger's box — its parent's box model
+        // is unaffected by an out-of-flow descendant, by spec — so the
+        // element screenshot silently clips to the collapsed size and comes
+        // back near-blank. `captureViewport` takes a plain viewport
+        // screenshot instead, showing whatever is actually on screen after
+        // state actions ran; the target locator is still used for the
+        // presence/visibility/image-readiness checks above.
+        const captureViewport = item.captureViewport ?? config.captureViewport ?? false;
+        const screenshot = captureViewport
+          ? await page.screenshot({ animations: 'disabled' })
+          : await target.screenshot({ animations: 'disabled' });
         await writeFile(path.join(output, screenshotPath), screenshot);
         record.screenshot = { path: screenshotPath, sha256: sha256(screenshot) };
         record.timing.totalMs = Math.round(performance.now() - began);
