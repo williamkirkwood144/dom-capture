@@ -10,10 +10,12 @@ import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { observe, actions, freezeVideoPhase, observeForms } from './fidelity-observations.mjs';
+
 const here = path.dirname(fileURLToPath(import.meta.url));
 const REDACTED = '[REDACTED]';
 const SENSITIVE = /pass(?:word)?|secret|token|auth|api[-_]?key|card|cc-|cvv|ssn|social|email|e-mail|phone|mobile/i;
-export const MANIFEST_VERSION = 1;
+export const MANIFEST_VERSION = 2;
 
 export function safeUrl(value) {
   const url = new URL(value);
@@ -44,8 +46,13 @@ export function validateConfig(config) {
     const captureViewport = capture.captureViewport ?? config.captureViewport;
     if (captureViewport !== undefined && typeof captureViewport !== 'boolean') throw new Error(`captures[${index}] has an invalid captureViewport`);
     for (const action of capture.state?.actions || []) {
-      if (!['click', 'hover', 'focus'].includes(action.action) || typeof action.selector !== 'string') throw new Error(`captures[${index}] has an invalid state action`);
+      if (!['click', 'hover', 'focus', 'touch', 'key', 'scroll', 'diagnostic_font_size', 'video_seek', 'video_play'].includes(action.action) || (!['key','scroll'].includes(action.action) && typeof action.selector !== 'string')) throw new Error(`captures[${index}] has an invalid state action`);
     }
+  }
+  if (new Set(config.captures.map(c=>c.name)).size!==config.captures.length) throw Error('duplicate capture names');
+  for (const c of config.captures) {
+    if(c.motion && (!Array.isArray(c.motion.sampleMs)||c.motion.sampleMs.length<5||c.motion.sampleMs.some(t=>!Number.isFinite(t)||t<0||t>30000))) throw Error('motion requires bounded five-phase samples');
+    if(c.mode && !['static','interaction','motion'].includes(c.mode)) throw Error('unsupported capture mode');
   }
   return config;
 }
@@ -216,7 +223,7 @@ async function applyState(page, state = {}) {
 // top at the end restores the position a fresh load would show, without
 // undoing that work.
 async function scrollThroughPage(page, { stepDelayMs = 300, decodeTimeoutMs = 4000 } = {}) {
-  await page.evaluate(async ({ delay, decodeTimeoutMs }) => {
+  return await page.evaluate(async ({ delay, decodeTimeoutMs }) => {
     const decodeSettledImages = async () => {
       const imgs = [...document.querySelectorAll('img')];
       await Promise.all(imgs.map((img) => Promise.race([
@@ -225,7 +232,7 @@ async function scrollThroughPage(page, { stepDelayMs = 300, decodeTimeoutMs = 40
       ])));
     };
     const step = () => Math.max(window.innerHeight || 800, 1);
-    let y = 0;
+    let y = 0;const trace=[];
     let previousHeight = -1;
     // Bounded by document height, which can grow as lazy sections mount; a
     // generous iteration cap keeps this from looping forever on a page that
@@ -234,13 +241,14 @@ async function scrollThroughPage(page, { stepDelayMs = 300, decodeTimeoutMs = 40
       const scrollHeight = document.documentElement.scrollHeight;
       if (y >= scrollHeight && scrollHeight === previousHeight) break;
       previousHeight = scrollHeight;
-      window.scrollTo(0, y);
+      window.scrollTo({left:0,top:y,behavior:'instant'});trace.push({action:'scroll',requested:{x:0,y},actual:{x:scrollX,y:scrollY},documentHeight:scrollHeight,at_ms:performance.now()});
       await new Promise((resolve) => setTimeout(resolve, delay));
       await decodeSettledImages();
       y += step();
     }
-    window.scrollTo(0, 0);
+    window.scrollTo({left:0,top:0,behavior:'instant'});
     await new Promise((resolve) => setTimeout(resolve, delay));
+    trace.push({action:'scroll',requested:{x:0,y:0},actual:{x:scrollX,y:scrollY},documentHeight:document.documentElement.scrollHeight,at_ms:performance.now()});return trace;
   }, { delay: stepDelayMs, decodeTimeoutMs });
 }
 
@@ -258,18 +266,23 @@ async function main() {
   try {
     for (const item of config.captures) {
       const viewport = item.viewport || config.viewport || { width: 1280, height: 900 };
-      const context = await browser.newContext({ viewport, deviceScaleFactor: 1 });
+      const context = await browser.newContext({ viewport, deviceScaleFactor: item.dpr || 1, hasTouch: item.hasTouch || false, reducedMotion: item.reducedMotion || 'no-preference' });
       const page = await context.newPage();
       const record = { name: item.name, source: { url: safeUrl(item.url), path: new URL(item.url).pathname }, selector: item.selector, state: item.state || {}, warnings: [], timing: {} };
+      const resourceTasks=[];record.resourceResponses=[];
+      page.on('response',response=>{const type=response.request().resourceType();if(!['stylesheet','font'].includes(type))return;const index=resourceTasks.length;resourceTasks.push((async()=>{try{const bytes=await response.body();const file=`${item.name}.resource-${index}.bin`;await writeFile(path.join(output,file),bytes);record.resourceResponses.push({url:safeUrl(response.url()),type,status:response.status(),path:file,sha256:sha256(bytes),bytes:bytes.length});}catch(error){record.resourceResponses.push({url:safeUrl(response.url()),type,status:response.status(),error:error.message});}})());});
       try {
         const began = performance.now();
         await page.goto(item.url, { waitUntil: 'load', timeout: item.timeoutMs || 30000 });
-        await applyState(page, item.state);
+        record.cell_key=item.cell_key || JSON.stringify([item.route_id || item.name,viewport.width,item.state_id || 'default']);
+        record.mode=item.mode || 'static';
+        record.action_trace = await actions(page,item.state?.actions || []);
+        if(item.state?.waitMs) await page.waitForTimeout(Math.min(item.state.waitMs,10000));
         const scrollSweep = item.scrollSweep ?? config.scrollSweep ?? false;
-        if (scrollSweep) await scrollThroughPage(page);
+        if (scrollSweep)record.action_trace.push(...await scrollThroughPage(page));
         record.source.finalUrl = validateFinalUrl(page.url(), allowlist, item.url);
         const target = page.locator(item.selector).first();
-        await target.scrollIntoViewIfNeeded();
+        if(!item.fullPage && !item.captureViewport) await target.scrollIntoViewIfNeeded();
         const box = await target.boundingBox();
         enforceBounds(box, item.bounds || config.bounds);
         const imageReadyTimeoutMs = item.imageReadyTimeoutMs ?? config.imageReadyTimeoutMs ?? 10000;
@@ -285,7 +298,23 @@ async function main() {
         });
         if (!pageMetrics.title.trim()) throw new Error('blank title rejected');
         if (!pageMetrics.fontsReady || pageMetrics.fontErrors.length) throw new Error(`invalid fonts rejected: ${pageMetrics.fontErrors.join(', ') || 'font loading incomplete'}`);
-        record.environment = pageMetrics;
+        record.environment = {...pageMetrics,browser:browser.version(),reducedMotion:item.reducedMotion || 'no-preference'};
+        record.scroll=await page.evaluate(()=>({x:scrollX,y:scrollY}));
+        const expectedScroll=item.state?.expectedScroll || (scrollSweep?{x:0,y:0}:null);
+        if(expectedScroll&&(record.scroll.x!==expectedScroll.x||record.scroll.y!==expectedScroll.y))throw Error('requested versus actual scroll state mismatch');
+        record.publicState=await page.evaluate(()=>({loggedOut:!document.querySelector('#wpadminbar,[data-authenticated="true"]')}));
+        if(!record.publicState.loggedOut) throw Error('authenticated public reference rejected');
+        if(item.state?.actions?.some(a=>a.action==='diagnostic_font_size'))record.diagnosticDefect=true;
+        const roles=item.roles || [{section_id:'document',role_id:'document',selector:item.selector}];
+        const observations=await observe(page,roles,imageReadyTimeoutMs);
+        observations.forms=await observeForms(page,item.formObservations||[]);
+        record.backgroundReadiness=observations.backgrounds;
+        record.imageReadiness.cssBackgroundImages='verified-via-decode-observation';
+        if(observations.backgrounds.some(b=>b.status!=='loaded'))throw Error('CSS background readiness rejected');
+        const observationsPath=`${item.name}.observations.json`;
+        const observationsBytes=JSON.stringify(observations,null,2)+'\n';
+        await writeFile(path.join(output,observationsPath),observationsBytes);
+        record.observations={path:observationsPath,sha256:sha256(observationsBytes)};
         record.rootBox = { x: Math.round(box.x), y: Math.round(box.y), width: Math.round(box.width), height: Math.round(box.height) };
         record.timing.beforeCaptureMs = Math.round(performance.now() - began);
         await page.addScriptTag({ content: captureJs });
@@ -300,7 +329,18 @@ async function main() {
         await writeFile(path.join(output, snapshotPath), snapshot);
         record.snapshot = { path: snapshotPath, sha256: sha256(snapshot) };
         record.assets = assetInventory(snapshot);
-        await maskLiveSensitiveControls(page);
+        const sensitiveFilled=await page.evaluate(()=>[...document.querySelectorAll('input,textarea')].some(el=>el.value && /password|secret|token|email|phone/i.test([el.type,el.name,el.id].join(' '))));
+        if(sensitiveFilled)throw Error('sensitive filled controls cannot be compared without an explicit exception');
+        record.masks=[];
+        if(record.mode==='static' && item.staticPhaseMs!==undefined)throw Error('global static DOM freeze prohibited; use named staticAnimations');
+        record.staticAnimations=[];
+        for(const phase of item.staticAnimations || []){if(typeof phase.selector!=='string'||!Number.isFinite(phase.timeMs)||phase.timeMs<0||phase.timeMs>30000)throw Error('invalid named animation phase');const actual=await page.locator(phase.selector).evaluate((el,timeMs)=>{const animations=el.getAnimations();if(!animations.length)throw Error('named animation not observed');for(const a of animations){a.pause();a.currentTime=timeMs;}return animations.map(a=>({currentTime:a.currentTime,playState:a.playState}));},phase.timeMs);record.staticAnimations.push({...phase,actual});}
+        if(record.mode==='static'&&item.videoPhase)record.videoPhase=await freezeVideoPhase(page,item.videoPhase);
+        record.animation={mode:record.mode==='static'?'declared_static':'enabled',named_phases:record.staticAnimations};
+        if(record.mode==='motion'){
+          record.sequence=[];const beganMotion=performance.now();record.action_trace.push(...await actions(page,item.motion.triggerActions || []));
+          for(const requested_ms of item.motion.sampleMs){await page.waitForTimeout(Math.max(0,requested_ms-(performance.now()-beganMotion)));const actual_ms=performance.now()-beganMotion;const bytes=await page.screenshot({animations:'allow'});const framePath=`${item.name}.phase-${requested_ms}.png`;await writeFile(path.join(output,framePath),bytes);const obs=await observe(page,roles,imageReadyTimeoutMs);const obsPath=`${item.name}.phase-${requested_ms}.json`;const ob=JSON.stringify(obs)+'\n';await writeFile(path.join(output,obsPath),ob);record.sequence.push({requested_ms,actual_ms,observation_ms:performance.now()-beganMotion,image:{path:framePath,sha256:sha256(bytes)},observations:{path:obsPath,sha256:sha256(ob)}});}
+        }
         const screenshotPath = `${item.name}.source.png`;
         // An element screenshot is clipped to the TARGET's own layout box, not
         // its visual paint bounds. A state action that opens an absolutely
@@ -313,16 +353,23 @@ async function main() {
         // state actions ran; the target locator is still used for the
         // presence/visibility/image-readiness checks above.
         const captureViewport = item.captureViewport ?? config.captureViewport ?? false;
-        const screenshot = captureViewport
-          ? await page.screenshot({ animations: 'disabled' })
-          : await target.screenshot({ animations: 'disabled' });
+        const screenshot = item.fullPage
+          ? await page.screenshot({fullPage:true, animations:'allow'})
+          : captureViewport ? await page.screenshot({animations:'allow'}) : await target.screenshot({animations:'allow'});
+        const finalScroll=await page.evaluate(()=>({x:scrollX,y:scrollY}));
+        if(finalScroll.x!==record.scroll.x||finalScroll.y!==record.scroll.y)throw Error('scroll changed during screenshot readiness');
+        record.captureKind=item.fullPage?'full_document':captureViewport?'viewport':'element';
         await writeFile(path.join(output, screenshotPath), screenshot);
         record.screenshot = { path: screenshotPath, sha256: sha256(screenshot) };
+        await Promise.all(resourceTasks);
+        record.resourceResponses.sort((a,b)=>a.path?.localeCompare(b.path)||0);
         record.timing.totalMs = Math.round(performance.now() - began);
         await writeFile(path.join(output, `${item.name}.json`), JSON.stringify(record, null, 2) + '\n');
         console.log(`ok ${item.name}: ${record.rootBox.width}x${record.rootBox.height}, ${record.warnings.length} warning(s)`);
       } catch (error) {
         record.error = error.message;
+        if(!/sensitive filled controls/.test(error.message))try{const bytes=await page.screenshot({fullPage:item.fullPage||false,animations:'allow'});const file=`${item.name}.invalid.png`;await writeFile(path.join(output,file),bytes);record.invalidScreenshot={path:file,sha256:sha256(bytes),validation:'invalid_capture'};}catch(screenshotError){record.invalidScreenshotError=screenshotError.message;}
+        await Promise.all(resourceTasks);
         await writeFile(path.join(output, `${item.name}.json`), JSON.stringify(record, null, 2) + '\n');
         console.error(`failed ${item.name}: ${error.message}`);
       } finally { await context.close(); }
