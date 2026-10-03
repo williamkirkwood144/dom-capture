@@ -11,11 +11,17 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { observe, actions, freezeVideoPhase, observeForms } from './fidelity-observations.mjs';
+import { discoverSourceRoles } from './source-role-discovery.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const REDACTED = '[REDACTED]';
 const SENSITIVE = /pass(?:word)?|secret|token|auth|api[-_]?key|card|cc-|cvv|ssn|social|email|e-mail|phone|mobile/i;
 export const MANIFEST_VERSION = 2;
+
+export function formSpecsForCapture(item = {}, rolePlan = null) {
+  if (item.expectedForm !== true && item.observeForms !== true) return [];
+  return rolePlan?.formObservations || item.formObservations || [];
+}
 
 export function safeUrl(value) {
   const url = new URL(value);
@@ -37,14 +43,19 @@ export function validateConfig(config) {
     if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || !origins.has(url.origin)) {
       throw new Error(`captures[${index}] URL is not an allowlisted credential-free HTTP(S) origin`);
     }
+    if (capture.discoverSourceRoles && (!capture.route_id || !capture.source_kind)) throw new Error('source role discovery needs route_id and source_kind');
     const vp = capture.viewport || config.viewport || { width: 1280, height: 900 };
     if (!Number.isInteger(vp.width) || !Number.isInteger(vp.height) || vp.width < 1 || vp.height < 1 || vp.width > 5000 || vp.height > 5000) throw new Error(`captures[${index}] has an invalid viewport`);
     const imageReadyTimeoutMs = capture.imageReadyTimeoutMs ?? config.imageReadyTimeoutMs ?? 10000;
+    const screenshotTimeoutMs = capture.screenshotTimeoutMs ?? config.screenshotTimeoutMs ?? 30000;
+    if (!Number.isInteger(screenshotTimeoutMs) || screenshotTimeoutMs < 1 || screenshotTimeoutMs > 120000) throw new Error(`captures[${index}] has an invalid screenshotTimeoutMs`);
     if (!Number.isInteger(imageReadyTimeoutMs) || imageReadyTimeoutMs < 1 || imageReadyTimeoutMs > 30000) throw new Error(`captures[${index}] has an invalid imageReadyTimeoutMs`);
     const scrollSweep = capture.scrollSweep ?? config.scrollSweep;
     if (scrollSweep !== undefined && typeof scrollSweep !== 'boolean') throw new Error(`captures[${index}] has an invalid scrollSweep`);
     const captureViewport = capture.captureViewport ?? config.captureViewport;
     if (captureViewport !== undefined && typeof captureViewport !== 'boolean') throw new Error(`captures[${index}] has an invalid captureViewport`);
+    if (capture.captureTiles !== undefined && typeof capture.captureTiles !== 'boolean') throw new Error(`captures[${index}] has an invalid captureTiles`);
+    if (capture.captureTiles && capture.fullPage) throw new Error(`captures[${index}] cannot combine captureTiles with fullPage`);
     for (const action of capture.state?.actions || []) {
       if (!['click', 'hover', 'focus', 'touch', 'key', 'scroll', 'diagnostic_font_size', 'video_seek', 'video_play'].includes(action.action) || (!['key','scroll'].includes(action.action) && typeof action.selector !== 'string')) throw new Error(`captures[${index}] has an invalid state action`);
     }
@@ -111,6 +122,75 @@ export function sha256(content) {
   return createHash('sha256').update(content).digest('hex');
 }
 
+export async function captureScreenshotWithSnapshot(page, {
+  outputDir, name, record, fullPage = false, captureViewport = false,
+  target = null, timeoutMs = 30000, snapshotKey = 'diagnosticSnapshot',
+  screenshotKey = 'diagnosticScreenshot',
+} = {}) {
+  if (!record[snapshotKey]) {
+    const rawHtml = await page.evaluate(() => document.documentElement.outerHTML);
+    const sanitizedSnapshot = await page.evaluate(redactInPage, rawHtml);
+    const snapshotPath = name + (snapshotKey === 'snapshot' ? '.snapshot.html' : '.missing-role-diagnostic.snapshot.html');
+    await writeFile(path.join(outputDir, snapshotPath), sanitizedSnapshot);
+    record[snapshotKey] = { path: snapshotPath, sha256: sha256(sanitizedSnapshot), validation: 'sanitized_dom_retained' };
+    record.assets = assetInventory(sanitizedSnapshot);
+  }
+  const fontState = await page.evaluate(() => {
+    const faces = [...(document.fonts || [])];
+    return {
+      fontStatus: document.fonts?.status || 'unavailable',
+      fontsReady: document.fonts?.status === 'loaded',
+      fontErrors: faces.filter(face => face.status === 'error').map(face => face.family),
+    };
+  });
+  try {
+    let bytes;
+    if (fullPage) bytes = await page.screenshot({ fullPage: true, animations: 'allow', timeout: timeoutMs });
+    else if (captureViewport) bytes = await page.screenshot({ animations: 'allow', timeout: timeoutMs });
+    else if (target) bytes = await target.screenshot({ animations: 'allow', timeout: timeoutMs });
+    else bytes = await page.screenshot({ animations: 'allow', timeout: timeoutMs });
+    const screenshotPath = name + (screenshotKey === 'screenshot' ? '.source.png' : '.missing-role-diagnostic.png');
+    await writeFile(path.join(outputDir, screenshotPath), bytes);
+    record[screenshotKey] = { path: screenshotPath, sha256: sha256(bytes), media_type: 'image/png' };
+    return { status: 'captured', path: screenshotPath, sha256: sha256(bytes) };
+  } catch (error) {
+    record.screenshotFailure = {
+      attempts: 1, fullPage, timeoutMs, ...fontState, error: error.message,
+    };
+    return { status: 'failed', error: error.message };
+  }
+}
+
+
+
+
+export function planViewportScreenshotTiles(documentHeight, viewportHeight, { overlapRatio=0.2, maxTiles=256 }={}) {
+ if(!Number.isFinite(documentHeight)||documentHeight<1||!Number.isFinite(viewportHeight)||viewportHeight<1) throw Error('invalid tile geometry');
+ if(!Number.isFinite(overlapRatio)||overlapRatio<0||overlapRatio>=1) throw Error('invalid overlapRatio');
+ const maxScroll=Math.max(0,Math.ceil(documentHeight-viewportHeight)), step=Math.max(1,Math.floor(viewportHeight*(1-overlapRatio))), positions=[0];
+ for(let y=step;y<maxScroll;y+=step) positions.push(y);
+ if(maxScroll>0&&positions.at(-1)!==maxScroll) positions.push(maxScroll);
+ const unique=[...new Set(positions)];
+ if(unique.length>maxTiles) throw Error('maxTiles exceeded');
+ let end=0; for(const y of unique){if(y>end)throw Error('tile plan leaves a gap');end=Math.max(end,Math.min(documentHeight,y+viewportHeight));}
+ if(end<documentHeight) throw Error('tile plan leaves a gap');
+ return unique;
+}
+export async function captureViewportTiles(page,{outputDir,name,record,timeoutMs=30000,maxTiles=256,overlapRatio=0.2}={}) {
+ if(!record.snapshot){const raw=await page.evaluate(()=>document.documentElement.outerHTML);const html=await page.evaluate(redactInPage,raw);const p=name+'.snapshot.html';await writeFile(path.join(outputDir,p),html);record.snapshot={path:p,sha256:sha256(html),validation:'sanitized_dom_retained'};record.assets=assetInventory(html);}
+ const initial=await page.evaluate(()=>({documentHeight:document.documentElement.scrollHeight,viewportHeight:innerHeight,viewportWidth:innerWidth,scrollX,scrollY,fontStatus:document.fonts?.status||'unavailable',fontsReady:document.fonts?.status==='loaded',fontErrors:[...(document.fonts||[])].filter(f=>f.status==='error').map(f=>f.family)}));
+ const positions=planViewportScreenshotTiles(initial.documentHeight,initial.viewportHeight,{overlapRatio,maxTiles});
+ record.tilePlan={...initial,overlapRatio,positions};record.tileScreenshots=[];const intervals=[];
+ const gapsNow=()=>{const gaps=[];let end=0;for(const[a,b]of intervals.sort((x,y)=>x[0]-y[0])){if(a>end)gaps.push({from:end,to:a});end=Math.max(end,b);}if(end<initial.documentHeight)gaps.push({from:end,to:initial.documentHeight});return gaps;};
+ for(let i=0;i<positions.length;i++){
+  const y=positions[i],actual=await page.evaluate(v=>{window.scrollTo({left:0,top:v,behavior:'instant'});return{x:scrollX,y:scrollY,documentHeight:document.documentElement.scrollHeight,viewportHeight:innerHeight,viewportWidth:innerWidth};},y);
+  if(actual.y!==y||actual.documentHeight!==initial.documentHeight||actual.viewportHeight!==initial.viewportHeight||actual.viewportWidth!==initial.viewportWidth){const error='scroll clamp or geometry changed';record.tileCoverage={status:'incomplete',gaps:gapsNow(),documentHeight:initial.documentHeight,reason:error};record.screenshotFailure={attempts:i,fullPage:false,timeoutMs,...initial,error,failedTile:i,requestedScrollY:y,actualScrollY:actual.y};return{status:'failed',error};}
+  const top=actual.y,bottom=Math.min(initial.documentHeight,top+initial.viewportHeight),file=`${name}.tile-${String(i+1).padStart(3,'0')}.png`;
+  try{const bytes=await page.screenshot({animations:'allow',timeout:timeoutMs});await writeFile(path.join(outputDir,file),bytes);record.tileScreenshots.push({index:i+1,path:file,sha256:sha256(bytes),media_type:'image/png',requestedScroll:{x:0,y},actualScroll:{x:actual.x,y:actual.y},bounds:{left:0,top,right:initial.viewportWidth,bottom},viewport:{width:initial.viewportWidth,height:initial.viewportHeight}});intervals.push([top,bottom]);}
+  catch(e){let fonts=initial;try{const measured=await page.evaluate(()=>({fontStatus:document.fonts?.status||'unavailable',fontsReady:document.fonts?.status==='loaded',fontErrors:[...(document.fonts||[])].filter(f=>f.status==='error').map(f=>f.family)}));if(measured&&typeof measured==='object')fonts=measured;}catch{}record.tileCoverage={status:'incomplete',gaps:gapsNow(),documentHeight:initial.documentHeight,reason:'tile screenshot failed'};record.screenshotFailure={attempts:i+1,fullPage:false,timeoutMs,...fonts,error:e.message,failedTile:i+1,requestedScrollY:y,actualScrollY:actual.y};return{status:'failed',error:e.message};}
+ }
+ const gaps=gapsNow();record.tileCoverage={status:gaps.length?'incomplete':'complete',gaps,documentHeight:initial.documentHeight,coveredThrough:initial.documentHeight};return gaps.length?{status:'failed',error:'tile coverage has gaps'}:{status:'captured',tiles:record.tileScreenshots.length};
+}
 export function assetInventory(html) {
   const assets = [];
   const seen = new Set();
@@ -270,7 +350,7 @@ async function main() {
       const page = await context.newPage();
       const record = { name: item.name, source: { url: safeUrl(item.url), path: new URL(item.url).pathname }, selector: item.selector, state: item.state || {}, warnings: [], timing: {} };
       const resourceTasks=[];record.resourceResponses=[];
-      page.on('response',response=>{const type=response.request().resourceType();if(!['stylesheet','font'].includes(type))return;const index=resourceTasks.length;resourceTasks.push((async()=>{try{const bytes=await response.body();const file=`${item.name}.resource-${index}.bin`;await writeFile(path.join(output,file),bytes);record.resourceResponses.push({url:safeUrl(response.url()),type,status:response.status(),path:file,sha256:sha256(bytes),bytes:bytes.length});}catch(error){record.resourceResponses.push({url:safeUrl(response.url()),type,status:response.status(),error:error.message});}})());});
+      page.on('response',response=>{const type=response.request().resourceType();if(!['stylesheet','font','image'].includes(type))return;const index=resourceTasks.length;resourceTasks.push((async()=>{try{const bytes=await response.body();const file=`${item.name}.resource-${index}.bin`;await writeFile(path.join(output,file),bytes);record.resourceResponses.push({url:safeUrl(response.url()),type,status:response.status(),path:file,sha256:sha256(bytes),bytes:bytes.length});}catch(error){record.resourceResponses.push({url:safeUrl(response.url()),type,status:response.status(),error:error.message});}})());});
       try {
         const began = performance.now();
         await page.goto(item.url, { waitUntil: 'load', timeout: item.timeoutMs || 30000 });
@@ -305,9 +385,11 @@ async function main() {
         record.publicState=await page.evaluate(()=>({loggedOut:!document.querySelector('#wpadminbar,[data-authenticated="true"]')}));
         if(!record.publicState.loggedOut) throw Error('authenticated public reference rejected');
         if(item.state?.actions?.some(a=>a.action==='diagnostic_font_size'))record.diagnosticDefect=true;
-        const roles=item.roles || [{section_id:'document',role_id:'document',selector:item.selector}];
+        const rolePlan=item.discoverSourceRoles?await discoverSourceRoles(page,{routeId:item.route_id,sourceKind:item.source_kind,routePath:new URL(item.url).pathname,expectedForm:Boolean(item.expectedForm)}):null;
+        const roles=rolePlan?.roles || item.roles || [{section_id:'document',role_id:'document',selector:item.selector}];
+        if(rolePlan)record.roleDiscovery=rolePlan;
         const observations=await observe(page,roles,imageReadyTimeoutMs);
-        observations.forms=await observeForms(page,item.formObservations||[]);
+        observations.forms=await observeForms(page,formSpecsForCapture(item,rolePlan));
         record.backgroundReadiness=observations.backgrounds;
         record.imageReadiness.cssBackgroundImages='verified-via-decode-observation';
         if(observations.backgrounds.some(b=>b.status!=='loaded'))throw Error('CSS background readiness rejected');
@@ -316,6 +398,18 @@ async function main() {
         await writeFile(path.join(output,observationsPath),observationsBytes);
         record.observations={path:observationsPath,sha256:sha256(observationsBytes)};
         record.rootBox = { x: Math.round(box.x), y: Math.round(box.y), width: Math.round(box.width), height: Math.round(box.height) };
+        if(rolePlan?.status==='incomplete'||observations.unresolvedRoles?.length){
+          record.unresolvedRoles=[...(rolePlan?.unresolved||[]),...(observations.unresolvedRoles||[])];
+          record.validationStatus='failed';
+          record.captureKind=item.captureTiles?'viewport_tiles':item.fullPage?'full_document':(item.captureViewport??config.captureViewport??false)?'viewport':'element';
+          const diagnosticResult = item.captureTiles ? await captureViewportTiles(page, { outputDir: output, name: item.name, record, timeoutMs: item.screenshotTimeoutMs ?? config.screenshotTimeoutMs ?? 30000 }) : await captureScreenshotWithSnapshot(page, {
+            outputDir: output, name: item.name, record, fullPage: Boolean(item.fullPage),
+            captureViewport: Boolean(item.captureViewport ?? config.captureViewport ?? false),
+            target, timeoutMs: item.screenshotTimeoutMs ?? config.screenshotTimeoutMs ?? 30000,
+          });
+          if (diagnosticResult.status === 'failed') throw new Error(diagnosticResult.error);
+          throw new Error('required source roles unresolved: '+record.unresolvedRoles.length);
+        }
         record.timing.beforeCaptureMs = Math.round(performance.now() - began);
         await page.addScriptTag({ content: captureJs });
         const result = await target.evaluate(async (el) => window.__domCapture.capture(el, { id: 'dce' }));
@@ -353,14 +447,16 @@ async function main() {
         // state actions ran; the target locator is still used for the
         // presence/visibility/image-readiness checks above.
         const captureViewport = item.captureViewport ?? config.captureViewport ?? false;
-        const screenshot = item.fullPage
-          ? await page.screenshot({fullPage:true, animations:'allow'})
-          : captureViewport ? await page.screenshot({animations:'allow'}) : await target.screenshot({animations:'allow'});
+        const screenshotResult = item.captureTiles ? await captureViewportTiles(page, { outputDir: output, name: item.name, record, timeoutMs: item.screenshotTimeoutMs ?? config.screenshotTimeoutMs ?? 30000 }) : await captureScreenshotWithSnapshot(page, {
+          outputDir: output, name: item.name, record, fullPage: Boolean(item.fullPage),
+          captureViewport: Boolean(captureViewport), target,
+          timeoutMs: item.screenshotTimeoutMs ?? config.screenshotTimeoutMs ?? 30000,
+          snapshotKey: 'snapshot', screenshotKey: 'screenshot',
+        });
+        if (screenshotResult.status === 'failed') throw new Error(screenshotResult.error);
         const finalScroll=await page.evaluate(()=>({x:scrollX,y:scrollY}));
-        if(finalScroll.x!==record.scroll.x||finalScroll.y!==record.scroll.y)throw Error('scroll changed during screenshot readiness');
-        record.captureKind=item.fullPage?'full_document':captureViewport?'viewport':'element';
-        await writeFile(path.join(output, screenshotPath), screenshot);
-        record.screenshot = { path: screenshotPath, sha256: sha256(screenshot) };
+        if(!item.captureTiles&&(finalScroll.x!==record.scroll.x||finalScroll.y!==record.scroll.y))throw Error('scroll changed during screenshot readiness');
+        record.captureKind=item.captureTiles?'viewport_tiles':item.fullPage?'full_document':captureViewport?'viewport':'element';
         await Promise.all(resourceTasks);
         record.resourceResponses.sort((a,b)=>a.path?.localeCompare(b.path)||0);
         record.timing.totalMs = Math.round(performance.now() - began);
@@ -368,7 +464,24 @@ async function main() {
         console.log(`ok ${item.name}: ${record.rootBox.width}x${record.rootBox.height}, ${record.warnings.length} warning(s)`);
       } catch (error) {
         record.error = error.message;
-        if(!/sensitive filled controls/.test(error.message))try{const bytes=await page.screenshot({fullPage:item.fullPage||false,animations:'allow'});const file=`${item.name}.invalid.png`;await writeFile(path.join(output,file),bytes);record.invalidScreenshot={path:file,sha256:sha256(bytes),validation:'invalid_capture'};}catch(screenshotError){record.invalidScreenshotError=screenshotError.message;}
+        if (!record.snapshot && !record.diagnosticSnapshot) {
+          try {
+            const rawHtml = await page.evaluate(() => document.documentElement.outerHTML);
+            const sanitizedSnapshot = await page.evaluate(redactInPage, rawHtml);
+            const snapshotPath = item.name + '.failure.snapshot.html';
+            await writeFile(path.join(output, snapshotPath), sanitizedSnapshot);
+            record.failureSnapshot = { path: snapshotPath, sha256: sha256(sanitizedSnapshot), validation: 'sanitized_failure_dom' };
+          } catch (snapshotError) { record.failureSnapshotError = snapshotError.message; }
+        }
+        if (/screenshot|font/i.test(error.message) && !record.screenshotFailure) {
+          try {
+            const fontState = await page.evaluate(() => {
+              const faces = [...(document.fonts || [])];
+              return { fontStatus: document.fonts?.status || 'unavailable', fontsReady: document.fonts?.status === 'loaded', fontErrors: faces.filter(face => face.status === 'error').map(face => face.family) };
+            });
+            record.screenshotFailure = { attempts: 1, fullPage: Boolean(item.fullPage), timeoutMs: item.screenshotTimeoutMs ?? config.screenshotTimeoutMs ?? 30000, ...fontState, error: error.message };
+          } catch { record.screenshotFailure = { attempts: 1, fullPage: Boolean(item.fullPage), error: error.message, fontStatus: 'unavailable' }; }
+        }
         await Promise.all(resourceTasks);
         await writeFile(path.join(output, `${item.name}.json`), JSON.stringify(record, null, 2) + '\n');
         console.error(`failed ${item.name}: ${error.message}`);

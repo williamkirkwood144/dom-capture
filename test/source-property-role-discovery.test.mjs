@@ -1,0 +1,6 @@
+import assert from 'node:assert/strict';
+import { chromium } from 'playwright';
+import { discoverSourceRoles } from '../tools/source-role-discovery.mjs';
+const b=await chromium.launch({channel:'chrome',headless:true});
+try{const p=await b.newPage({viewport:{width:390,height:900}});await p.setContent('<title>Property Four</title><body><div id=\"div_block-56-17\" class=\"smooth-content\"><section><h2 id=\"headline-17-173\"></h2><h2 id=\"headline-6-173\"></h2><div id=\"text_block-8-173\"></div><img id=\"image-12-173\" src=\"/hero.jpg\"><div class=\"swiper-container\"><img src=\"/other.jpg\"></div><h2>Book a Consultation</h2><a href=\"tel:1\">Call</a></section></div></body>');let r=await discoverSourceRoles(p,{routeId:'p',sourceKind:'property',routePath:'/p/'});assert.equal(r.status,'observed');assert(r.roles.some(x=>x.role_id==='property_content'));assert(r.observed_absent.some(x=>x.role_id==='semantic_main'));assert(r.observed_absent.some(x=>x.role_id==='page_heading'));await p.setContent('<body><div class=\"smooth-content\">A</div><div class=\"smooth-content\">B</div></body>');r=await discoverSourceRoles(p,{routeId:'p',sourceKind:'property',routePath:'/p/'});assert.equal(r.status,'incomplete');assert(!r.roles.some(x=>x.role_id==='property_content'));}finally{await b.close()}
+console.log('property role tests passed');

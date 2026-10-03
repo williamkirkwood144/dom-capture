@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { assetInventory, imageDecodeStatus, safeUrl, sha256, summarizeImageReadiness, validateConfig } from '../tools/evidence-runner.mjs';
+import { assetInventory, formSpecsForCapture, imageDecodeStatus, safeUrl, sha256, summarizeImageReadiness, validateConfig } from '../tools/evidence-runner.mjs';
 
 assert.equal(safeUrl('https://example.com/a?token=abc&mode=view'), 'https://example.com/a?token=%5BREDACTED%5D&mode=%5BREDACTED%5D');
 const config = { allowlist: ['https://example.com'], captures: [{ name: 'ok', url: 'https://example.com/a', selector: 'main' }] };
@@ -9,6 +9,9 @@ assert.throws(() => validateConfig({ ...config, captures: [{ ...config.captures[
 assert.throws(() => validateConfig({ ...config, captures: [{ ...config.captures[0], state: { actions: [{ action: 'evaluate', selector: 'main' }] } }] }), /invalid state action/);
 assert.throws(() => validateConfig({ ...config, captures: [{ ...config.captures[0], url: 'https://user:password@example.com/a' }] }), /credential-free/);
 assert.throws(() => validateConfig({ ...config, imageReadyTimeoutMs: 0 }), /invalid imageReadyTimeoutMs/);
+assert.equal(validateConfig({ ...config, captures: [{ ...config.captures[0], screenshotTimeoutMs: 90000 }] }).captures[0].screenshotTimeoutMs, 90000);
+assert.throws(() => validateConfig({ ...config, captures: [{ ...config.captures[0], screenshotTimeoutMs: 0 }] }), /invalid screenshotTimeoutMs/);
+assert.throws(() => validateConfig({ ...config, captures: [{ ...config.captures[0], screenshotTimeoutMs: 120001 }] }), /invalid screenshotTimeoutMs/);
 assert.equal(validateConfig({ ...config, scrollSweep: true }).scrollSweep, true);
 assert.throws(() => validateConfig({ ...config, scrollSweep: 'yes' }), /invalid scrollSweep/);
 assert.equal(validateConfig({ ...config, captureViewport: true }).captureViewport, true);
@@ -73,3 +76,9 @@ assert.deepEqual(await imageDecodeStatus({
   decode: async () => { throw new Error('must not be called for an element with no client rects'); },
 }, 20), { url: 'https://example.com/hidden.png', status: 'not-requested', reason: 'not rendered (display:none in its ancestry at this viewport)' });
 console.log('evidence runner unit tests passed');
+
+const incidentalLeadConnector = { expectedForm: false, formObservations: [{ selector: '#incidental' }] };
+assert.deepEqual(formSpecsForCapture(incidentalLeadConnector), [], 'incidental embeds do not trigger field inspection during static capture');
+const expectedFormPlan = { formObservations: [{ selector: '#lead', allowedOrigins: ['https://api.leadconnectorhq.com'] }] };
+assert.deepEqual(formSpecsForCapture({ expectedForm: true }, expectedFormPlan), expectedFormPlan.formObservations);
+assert.deepEqual(formSpecsForCapture({ observeForms: true, formObservations: [{ selector: '#explicit' }] }), [{ selector: '#explicit' }]);
