@@ -867,6 +867,9 @@
         if (lower.startsWith('on') || DROP_ATTRS.has(lower)) continue;
         if (lower === 'class') continue; // the page's class names never travel; ours replace them
         if (tag === 'slot' && lower === 'name') continue;
+        const formValueAttribute=lower==='value'&&isHtml&&['input','textarea','select','option'].includes(src.localName);
+        const authoredButtonLabel=formValueAttribute&&src.localName==='input'&&['button','submit','reset'].includes((src.getAttribute('type')||'text').toLowerCase());
+        if(formValueAttribute&&!authoredButtonLabel)continue;
         let value = attr.value;
         if (URL_ATTRS.has(lower)) {
           if (/^\s*javascript:/i.test(value)) continue;
@@ -898,7 +901,7 @@
       return out;
     }
 
-    /** Bake live state (chosen image, form values) into attributes. */
+    /** Bake safe visual media state; never serialize user-entered form state. */
     freezeState(src, out, tag) {
       if (tag === 'img') {
         if (src.currentSrc) {
@@ -908,19 +911,13 @@
         }
       } else if (tag === 'input') {
         const type = (src.getAttribute('type') || 'text').toLowerCase();
-        if (type === 'checkbox' || type === 'radio') {
-          if (src.checked) out.setAttribute('checked', '');
-          else out.removeAttribute('checked');
-        } else if (type !== 'password' && type !== 'file' && type !== 'hidden') {
-          out.setAttribute('value', src.value);
-        } else if (type === 'password') {
-          out.removeAttribute('value');
-        }
+        if(!['button','submit','reset'].includes(type))out.removeAttribute('value');
+        out.removeAttribute('checked');
       } else if (tag === 'textarea') {
-        out.textContent = src.value;
+        out.textContent = '';
       } else if (tag === 'option') {
-        if (src.selected) out.setAttribute('selected', '');
-        else out.removeAttribute('selected');
+        out.removeAttribute('value');
+        out.removeAttribute('selected');
       } else if (tag === 'video' || tag === 'audio') {
         out.removeAttribute('autoplay');
       }

@@ -159,7 +159,7 @@ async function run() {
       check('font without CORS headers embedded; note explains why', /font-family: "Local Mono"; src: url\("data:font\/woff2;base64,/.test(s) && result.notes.some((n) => n.includes('embedded')));
       check('svg geometry stays in attributes', !/\bd: path\(/.test(s) && s.includes('d="M5 35 L30 10 L60 25 L95 5"'));
       check('links absolutized', s.includes(`href="${origin}/reports/q3"`));
-      check('form state frozen', s.includes('value="typed by user"') && /type="checkbox"[^>]*checked/.test(s) && /<option[^>]*selected[^>]*>Pro/.test(s) && />live notes<\/textarea>/.test(s));
+      check('form values and selection state are omitted; static button labels remain', !s.includes('typed by user') && !s.includes('live notes') && !/type="checkbox"[^>]*checked/.test(s) && !/<option[^>]*selected/.test(s) && /<button[^>]*>Save/.test(s));
       check('canvas became an image', /<img[^>]+src="data:image\/png/.test(s) && !s.includes('<canvas'));
       check('picture source dropped, currentSrc used, lazy removed', !s.includes('<source') && s.includes(`src="${origin}/pixel.svg"`) && !s.includes('loading='));
       check('blocked cross-origin sheet reported', result.warnings.some((w) => w.includes('blocked.css')));

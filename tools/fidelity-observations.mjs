@@ -26,7 +26,9 @@ export async function actions(page, steps=[]){
   const trace=[];
   for(const step of steps){const began=performance.now();
     let mediaObservation=null;
-    if(step.action==='diagnostic_font_size'){if(!Number.isInteger(step.pixels)||step.pixels<24||step.pixels>192)throw Error('invalid diagnostic heading size');const target=page.locator(step.selector);if(await target.count()!==1)throw Error('diagnostic heading must be unique');mediaObservation=await target.evaluate((el,pixels)=>{if(!['H1','H2'].includes(el.tagName))throw Error('diagnostic target must be heading');const before={fontSize:getComputedStyle(el).fontSize,bounds:el.getBoundingClientRect().toJSON()};el.style.fontSize=pixels+'px';return {before,after:{fontSize:getComputedStyle(el).fontSize,bounds:el.getBoundingClientRect().toJSON()},diagnostic:true};},step.pixels);}
+    if(step.action==='form_combobox_open'){const {frame,combo,origin}=await leadConnectorFormFrame(page,step);if(await combo.getAttribute('aria-expanded')==='true')throw Error('LeadConnector combobox already open');await combo.click();mediaObservation=await snapshotLeadConnectorCombobox(frame,origin);}
+    else if(step.action==='form_combobox_dismiss'){const {frame,combo}=await leadConnectorFormFrame(page,step);if(await combo.getAttribute('aria-expanded')!=='true')throw Error('LeadConnector combobox is not open before Escape');await combo.press('Escape');await frame.waitForFunction(()=>{const combo=document.querySelector('[role="combobox"]'),shown=el=>{const s=getComputedStyle(el);return !!el.getClientRects().length&&s.display!=='none'&&s.visibility!=='hidden'&&Number(s.opacity)!==0;};return combo?.getAttribute('aria-expanded')==='false'&&!([...document.querySelectorAll('[role="listbox"],[role="option"]')].some(shown));},null,{timeout:3000});mediaObservation={dismissed:true,key:'Escape',frame_origin:LEADCONNECTOR_FORM_ORIGIN};}
+    else if(step.action==='diagnostic_font_size'){if(!Number.isInteger(step.pixels)||step.pixels<24||step.pixels>192)throw Error('invalid diagnostic heading size');const target=page.locator(step.selector);if(await target.count()!==1)throw Error('diagnostic heading must be unique');mediaObservation=await target.evaluate((el,pixels)=>{if(!['H1','H2'].includes(el.tagName))throw Error('diagnostic target must be heading');const before={fontSize:getComputedStyle(el).fontSize,bounds:el.getBoundingClientRect().toJSON()};el.style.fontSize=pixels+'px';return {before,after:{fontSize:getComputedStyle(el).fontSize,bounds:el.getBoundingClientRect().toJSON()},diagnostic:true};},step.pixels);}
     else if(step.action==='video_seek')mediaObservation=await freezeVideoPhase(page,step);
     else if(step.action==='video_play')mediaObservation=await playVideo(page,step);
     else if(step.action==='scroll'){if(!Number.isFinite(step.x??0)||!Number.isFinite(step.y)||Math.abs(step.y)>100000)throw Error('invalid bounded scroll');await page.evaluate(({x,y})=>scrollTo({left:x,top:y,behavior:'instant'}),{x:step.x||0,y:step.y});}
@@ -87,10 +89,50 @@ export async function observeForms(page,specs=[]){
    const shown=el=>{const s=getComputedStyle(el);return !!el.getClientRects().length&&s.display!=='none'&&s.visibility!=='hidden';};
    const box=el=>{const b=el.getBoundingClientRect();return {x:b.x+scrollX,y:b.y+scrollY,width:b.width,height:b.height};};
    const controls=[...document.querySelectorAll('input,select,textarea,button')].filter(shown).map(el=>({tag:el.tagName,type:el.type||null,id:el.id,name:el.name,labels:[...(el.labels||[])].map(l=>l.textContent),ariaLabel:el.getAttribute('aria-label'),placeholder:el.getAttribute('placeholder'),required:el.required||false,disabled:el.disabled||false,readOnly:el.readOnly||false,pattern:el.getAttribute('pattern'),min:el.getAttribute('min'),max:el.getAttribute('max'),minLength:el.minLength??null,maxLength:el.maxLength??null,bounds:box(el),styles:Object.fromEntries(['fontFamily','fontSize','color','backgroundColor','borderColor','opacity','transform'].map(k=>[k,getComputedStyle(el)[k]])),validity:el.validity?Object.fromEntries(['valid','valueMissing','typeMismatch','patternMismatch','tooLong','tooShort','rangeUnderflow','rangeOverflow','stepMismatch','badInput','customError'].map(k=>[k,el.validity[k]])):null}));
-   const statuses=[...document.querySelectorAll('[role="alert"],[role="status"],[aria-live]')].filter(shown).map(el=>({text:el.textContent,role:el.getAttribute('role'),ariaLive:el.getAttribute('aria-live'),bounds:box(el)}));
+   const statuses=[...document.querySelectorAll('[role="alert"],[role="status"],[aria-live]')].filter(shown).map(el=>({role:el.getAttribute('role'),ariaLive:el.getAttribute('aria-live'),bounds:box(el)}));
    return {controls,statuses,scroll:{x:scrollX,y:scrollY},submission:'never_attempted',validation:'read_only_validity_no_events',success:'unobserved',error:'unobserved'};
   });
   forms.push({role_id:spec.role_id,selector:spec.selector,frame_origin:url.origin,frame_path:url.pathname,...observed});
  }
  return forms;
+}
+
+const LEADCONNECTOR_FORM_ORIGIN='https://api.leadconnectorhq.com';
+const VISIBLE_FORM_ROLES='[role="combobox"], [role="listbox"], [role="option"]';
+async function leadConnectorFormFrame(page,step){
+ if(Object.keys(step).some(key=>!['action','selector'].includes(key)))throw Error('unexpected form combobox action field');
+ if(typeof step.selector!=='string'||!step.selector.trim())throw Error('form combobox action requires a frame selector');
+ const frameElement=page.locator(step.selector);if(await frameElement.count()!==1)throw Error('form frame selector must be unique');
+ const handle=await frameElement.elementHandle();if(!handle)throw Error('form frame element missing');
+ const frame=await handle.contentFrame();await handle.dispose();if(!frame)throw Error('form child frame missing');
+ let origin;try{origin=new URL(frame.url()).origin;}catch{throw Error('form frame origin unapproved');}if(origin!==LEADCONNECTOR_FORM_ORIGIN)throw Error('form frame origin unapproved');
+ const combo=frame.locator('[role="combobox"]');if(await combo.count()!==1)throw Error('form combobox must be unique');
+ if(!await combo.isVisible())throw Error('form combobox is not visible');return {frame,combo,origin};
+}
+async function snapshotLeadConnectorCombobox(frame,origin){
+ const snapshot=await frame.evaluate(selector=>{
+  const visible=el=>{const s=getComputedStyle(el);return !!el.getClientRects().length&&s.display!=='none'&&s.visibility!=='hidden'&&Number(s.opacity)!==0;};
+  const roles=[...document.querySelectorAll(selector)].filter(visible).map(el=>{const role=el.getAttribute('role'),r=el.getBoundingClientRect();return {role,...(role==='option'?{text:(el.innerText||el.textContent||'').trim()}:{}),bounds:{x:r.x+scrollX,y:r.y+scrollY,width:r.width,height:r.height},...(role==='combobox'?{aria:{expanded:el.getAttribute('aria-expanded'),controls:el.getAttribute('aria-controls'),haspopup:el.getAttribute('aria-haspopup')}}:{})};});
+  const combo=document.querySelector('[role="combobox"]');return {open:combo?.getAttribute('aria-expanded')==='true'&&roles.some(r=>r.role==='listbox')&&roles.some(r=>r.role==='option'),roles};
+ },VISIBLE_FORM_ROLES);
+ if(!snapshot.open)throw Error('LeadConnector combobox did not expose a visible open listbox/options');
+ return {frame_origin:origin,...snapshot};
+}
+
+// The check stays inside the allowlisted frame and returns only a boolean.
+export async function rejectVisibleFormValues(page,specs=[]){
+ for(const spec of specs){
+  if(typeof spec.selector!=='string'||!Array.isArray(spec.allowedOrigins)||!spec.allowedOrigins.length)throw Error('privacy rejected: form frame needs exact allowed origins');
+  const locator=page.locator(spec.selector);if(await locator.count()!==1)throw Error('privacy rejected: form frame selector is not unique');
+  const handle=await locator.elementHandle(),frame=await handle?.contentFrame();if(!frame)throw Error('privacy rejected: form frame unavailable');
+  if(!spec.allowedOrigins.includes(new URL(frame.url()).origin))throw Error('privacy rejected: form frame origin not allowed');
+  const found=await frame.evaluate(()=>{
+   const visible=el=>{const s=getComputedStyle(el),r=el.getBoundingClientRect();return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'&&Number(s.opacity)!==0;},nonempty=value=>String(value??'').trim().length>0;
+   for(const el of document.querySelectorAll('input,textarea,select')){if(!visible(el))continue;if(el instanceof HTMLInputElement&&['button','submit','reset','image','hidden'].includes(el.type))continue;if(el instanceof HTMLInputElement&&['checkbox','radio'].includes(el.type)){if(el.checked)return true;continue;}if(nonempty(el.value))return true;}
+   for(const el of document.querySelectorAll('[contenteditable=""],[contenteditable="true"],[role="textbox"],[role="combobox"]')){if(!visible(el))continue;const role=el.getAttribute('role'),editable=el.isContentEditable||role==='textbox'||(role==='combobox'&&['list','inline','both'].includes(el.getAttribute('aria-autocomplete')));if(!editable)continue;const placeholder=el.getAttribute('aria-placeholder')||el.getAttribute('placeholder')||'',rendered=el.getAttribute('aria-valuetext')||el.getAttribute('aria-valuenow')||el.innerText||el.textContent||'';if(nonempty(rendered)&&String(rendered).trim()!==String(placeholder).trim())return true;}
+   return false;
+  });
+  if(found)throw Error('privacy rejected: visible child-frame form value present; screenshot and evidence omitted');
+ }
+ return {inspection:'transient_boolean_only',values_persisted:false};
 }

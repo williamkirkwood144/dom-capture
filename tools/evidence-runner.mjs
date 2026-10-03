@@ -10,7 +10,7 @@ import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { observe, actions, freezeVideoPhase, observeForms } from './fidelity-observations.mjs';
+import { observe, actions, freezeVideoPhase, observeForms, rejectVisibleFormValues } from './fidelity-observations.mjs';
 import { discoverSourceRoles } from './source-role-discovery.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -57,8 +57,13 @@ export function validateConfig(config) {
     if (capture.captureTiles !== undefined && typeof capture.captureTiles !== 'boolean') throw new Error(`captures[${index}] has an invalid captureTiles`);
     if (capture.captureTiles && capture.fullPage) throw new Error(`captures[${index}] cannot combine captureTiles with fullPage`);
     for (const action of capture.state?.actions || []) {
-      if (!['click', 'hover', 'focus', 'touch', 'key', 'scroll', 'diagnostic_font_size', 'video_seek', 'video_play'].includes(action.action) || (!['key','scroll'].includes(action.action) && typeof action.selector !== 'string')) throw new Error(`captures[${index}] has an invalid state action`);
+      if (!['click', 'hover', 'focus', 'touch', 'key', 'scroll', 'diagnostic_font_size', 'video_seek', 'video_play', 'form_combobox_open'].includes(action.action) || (!['key','scroll'].includes(action.action) && typeof action.selector !== 'string')) throw new Error(`captures[${index}] has an invalid state action`);
     }
+    const actions=capture.state?.actions||[],opens=actions.filter(a=>a.action==='form_combobox_open'),after=capture.state?.afterCaptureActions||[];
+    if(opens.length&&(actions.length!==1||after.length!==1||after[0].action!=='form_combobox_dismiss'))throw new Error(`captures[${index}] form combobox must be the sole state action with paired Escape dismissal`);
+    if(opens.length&&after[0].selector!==opens[0].selector)throw new Error(`captures[${index}] form combobox dismissal must use the matching selector`);
+    if(!opens.length&&after.length)throw new Error(`captures[${index}] has form dismissal without a paired open action`);
+    if((capture.motion?.triggerActions||[]).some(a=>a.action==='form_combobox_open'))throw new Error(`captures[${index}] form combobox open cannot be a motion trigger`);
   }
   if (new Set(config.captures.map(c=>c.name)).size!==config.captures.length) throw Error('duplicate capture names');
   for (const c of config.captures) {
@@ -68,24 +73,15 @@ export function validateConfig(config) {
   return config;
 }
 
-function sensitiveSelector() {
-  return 'input, textarea, select';
-}
-
-// Runs in the page. It masks controls before screenshots and sanitizes captured
-// markup before it leaves the browser context.
+// Runs only on detached serialized markup; dynamic form values never travel.
 function redactInPage(html) {
-  const sensitive = (el) => el.type === 'password' || /pass(?:word)?|secret|token|auth|api[-_]?key|card|cc-|cvv|ssn|social|email|e-mail|phone|mobile/i.test([el.name, el.id, el.autocomplete, el.placeholder].filter(Boolean).join(' '));
   const doc = new DOMParser().parseFromString(html, 'text/html');
-  for (const el of doc.querySelectorAll('input, textarea, select')) {
-    if (!sensitive(el)) continue;
-    el.setAttribute('value', '[REDACTED]');
-    if (el.localName === 'textarea') el.textContent = '[REDACTED]';
-    if (el.localName === 'select') for (const option of el.options) {
-      option.selected = false;
-      option.value = '[REDACTED]';
-      option.textContent = '[REDACTED]';
-    }
+  for (const el of doc.querySelectorAll('input, textarea, select, option')) {
+    const safeButtonLabel=el.localName==='input'&&['button','submit','reset'].includes((el.getAttribute('type')||'text').toLowerCase());
+    if(!safeButtonLabel)el.removeAttribute('value');
+    if(el.localName==='input'&&!safeButtonLabel)el.removeAttribute('checked');
+    if(el.localName==='textarea')el.textContent='';
+    if(el.localName==='option')el.removeAttribute('selected');
   }
   // Query strings often carry tokens. Redact their values in attributes,
   // comments and style text without changing URL path/origin evidence.
@@ -93,16 +89,12 @@ function redactInPage(html) {
     .replace(/([?&][A-Za-z0-9_.~-]+)=([^&#"'\s<>]*)/g, '$1=[REDACTED]');
 }
 
-async function maskLiveSensitiveControls(page) {
-  await page.evaluate(() => {
-    const sensitive = (el) => el.type === 'password' || /pass(?:word)?|secret|token|auth|api[-_]?key|card|cc-|cvv|ssn|social|email|e-mail|phone|mobile/i.test([el.name, el.id, el.autocomplete, el.placeholder].filter(Boolean).join(' '));
-    for (const el of document.querySelectorAll('input, textarea, select')) {
-      if (!sensitive(el)) continue;
-      if ('value' in el) el.value = '[REDACTED]';
-      el.style.setProperty('color', 'transparent', 'important');
-      el.style.setProperty('text-shadow', '0 0 8px #444', 'important');
-    }
-  });
+async function rejectSensitiveTopLevelControls(page) {
+  const count=await page.evaluate(()=>[...document.querySelectorAll('input,textarea,select')].filter(el=>
+    /pass(?:word)?|secret|token|auth|api[-_]?key|card|cc-|cvv|ssn|social|email|e-mail|phone|mobile/i.test([el.localName,el.type,el.name,el.id,el.autocomplete,el.getAttribute('placeholder')].filter(Boolean).join(' '))
+  ).length);
+  if(count)throw Error(`sensitive top-level controls present (${count}); rejected by metadata-only policy without reading values`);
+  return {inspection:'metadata_only',live_values:'never_read'};
 }
 
 function enforceBounds(box, bounds = {}) {
@@ -354,6 +346,7 @@ async function main() {
       try {
         const began = performance.now();
         await page.goto(item.url, { waitUntil: 'load', timeout: item.timeoutMs || 30000 });
+        record.formValuePolicy=await rejectSensitiveTopLevelControls(page);
         record.cell_key=item.cell_key || JSON.stringify([item.route_id || item.name,viewport.width,item.state_id || 'default']);
         record.mode=item.mode || 'static';
         record.action_trace = await actions(page,item.state?.actions || []);
@@ -389,7 +382,9 @@ async function main() {
         const roles=rolePlan?.roles || item.roles || [{section_id:'document',role_id:'document',selector:item.selector}];
         if(rolePlan)record.roleDiscovery=rolePlan;
         const observations=await observe(page,roles,imageReadyTimeoutMs);
-        observations.forms=await observeForms(page,formSpecsForCapture(item,rolePlan));
+        const formSpecs=formSpecsForCapture(item,rolePlan);
+        if(formSpecs.length)record.childFramePrivacy=await rejectVisibleFormValues(page,formSpecs);
+        observations.forms=await observeForms(page,formSpecs);
         record.backgroundReadiness=observations.backgrounds;
         record.imageReadiness.cssBackgroundImages='verified-via-decode-observation';
         if(observations.backgrounds.some(b=>b.status!=='loaded'))throw Error('CSS background readiness rejected');
@@ -423,8 +418,6 @@ async function main() {
         await writeFile(path.join(output, snapshotPath), snapshot);
         record.snapshot = { path: snapshotPath, sha256: sha256(snapshot) };
         record.assets = assetInventory(snapshot);
-        const sensitiveFilled=await page.evaluate(()=>[...document.querySelectorAll('input,textarea')].some(el=>el.value && /password|secret|token|email|phone/i.test([el.type,el.name,el.id].join(' '))));
-        if(sensitiveFilled)throw Error('sensitive filled controls cannot be compared without an explicit exception');
         record.masks=[];
         if(record.mode==='static' && item.staticPhaseMs!==undefined)throw Error('global static DOM freeze prohibited; use named staticAnimations');
         record.staticAnimations=[];
@@ -454,6 +447,7 @@ async function main() {
           snapshotKey: 'snapshot', screenshotKey: 'screenshot',
         });
         if (screenshotResult.status === 'failed') throw new Error(screenshotResult.error);
+        if(item.state?.afterCaptureActions?.length)record.afterCaptureActionTrace=await actions(page,item.state.afterCaptureActions);
         const finalScroll=await page.evaluate(()=>({x:scrollX,y:scrollY}));
         if(!item.captureTiles&&(finalScroll.x!==record.scroll.x||finalScroll.y!==record.scroll.y))throw Error('scroll changed during screenshot readiness');
         record.captureKind=item.captureTiles?'viewport_tiles':item.fullPage?'full_document':captureViewport?'viewport':'element';
@@ -464,7 +458,10 @@ async function main() {
         console.log(`ok ${item.name}: ${record.rootBox.width}x${record.rootBox.height}, ${record.warnings.length} warning(s)`);
       } catch (error) {
         record.error = error.message;
-        if (!record.snapshot && !record.diagnosticSnapshot) {
+        if(item.state?.afterCaptureActions?.length&&record.action_trace?.some(a=>a.action==='form_combobox_open'&&a.mediaObservation?.open)){
+          try{record.afterCaptureActionTrace=await actions(page,item.state.afterCaptureActions);}catch(cleanupError){record.afterCaptureActionError=cleanupError.message;}
+        }
+        if (!/privacy rejected/.test(error.message) && !record.snapshot && !record.diagnosticSnapshot) {
           try {
             const rawHtml = await page.evaluate(() => document.documentElement.outerHTML);
             const sanitizedSnapshot = await page.evaluate(redactInPage, rawHtml);
